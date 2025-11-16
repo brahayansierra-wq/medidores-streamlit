@@ -12,9 +12,9 @@ from catboost import CatBoostRegressor, CatBoostClassifier
 # CONFIGURACIÓN
 # ============================================================
 
-EMP_Q3 = 4 - (4/3)   # ≈ 2.67%
+EMP_Q3 = 4 #- (4/3)   # ≈ 2.67%
 MAX_YEARS = 15      
-SHEET_URL = st.secrets["google_sheets_url"]   # ⚠ ENSÉÑAME ESTE VALOR
+SHEET_URL = st.secrets["https://docs.google.com/spreadsheets/d/e/2PACX-1vTh6UM90hkGvj-aqIByeP7MClXR_kjkt2EmIwF_vuMwkFyvLyuG2YTtotwG0A_GaYa8B7hIC0f4SLox/pub?output=xlsx"]   # ⚠ ENSÉÑAME ESTE VALOR
 MODELS_PATH = "modelos"                       # Carpeta con .cbm
 DEGRADACIONES_FILE = "vida_util_degradacion.csv"
 
