@@ -114,7 +114,7 @@ def cargar_modelos():
 @st.cache_data
 def cargar_degradaciones():
     base_path = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base_path, "vida_util_degradacion.csv")
+    path = os.path.join(base_path, "data", "vida_util_degradacion.csv")
     df_ic = pd.read_csv(path)
     return df_ic
 
