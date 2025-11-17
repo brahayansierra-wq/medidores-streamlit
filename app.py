@@ -284,12 +284,22 @@ def exportar_google_sheets(df):
         worksheet = sheet.add_worksheet(
             title=nombre_hoja,
             rows=str(len(df) + 10),
-            cols=str(len(df.columns) + 5)
+            cols=str(len(df.columns) + 10)
         )
 
+        # Subir datos
         data = [df.columns.tolist()] + df.astype(str).values.tolist()
         worksheet.update(data)
 
+        # -------- GENERADOR DE LETRAS DE COLUMNA --------
+        def col_letter(idx):  # idx es índice 1-based
+            result = ""
+            while idx > 0:
+                idx, rem = divmod(idx - 1, 26)
+                result = chr(65 + rem) + result
+            return result
+
+        # Columnas clave
         col_pred = df.columns.get_loc("Pred_Conformidad") + 1
         col_riesgo = df.columns.get_loc("Nivel_de_Riesgo") + 1
         col_intervalo = df.columns.get_loc("Dictamen_por_intervalo") + 1
@@ -301,31 +311,37 @@ def exportar_google_sheets(df):
         amarillo = CellFormat(backgroundColor=Color(1.00, 1.00, 0.60))
         gris = CellFormat(backgroundColor=Color(0.90, 0.90, 0.90))
 
-        for i in range(2, n_rows + 1):
-            pred_v = df.iloc[i-2]["Pred_Conformidad"]
-            riesgo_v = df.iloc[i-2]["Nivel_de_Riesgo"]
-            dict_v = df.iloc[i-2]["Dictamen_por_intervalo"]
+        # --------- FORMATO EN RANGOS GRANDES (EFICIENTE) ---------
 
-            fmt = verde if pred_v == "CUMPLE" else rojo
-            format_cell_range(worksheet, f"{chr(64+col_pred)}{i}", fmt)
+        # Pred_Conformidad
+        valores_pred = df["Pred_Conformidad"].tolist()
+        col_L = col_letter(col_pred)
+        for i, v in enumerate(valores_pred, start=2):
+            fmt = verde if v == "CUMPLE" else rojo
+            format_cell_range(worksheet, f"{col_L}{i}", fmt)
 
-            if riesgo_v == "BAJO":
-                fmt = verde
-            elif riesgo_v == "MEDIO":
-                fmt = amarillo
-            elif riesgo_v == "ALTO":
-                fmt = rojo
-            else:
-                fmt = gris
-            format_cell_range(worksheet, f"{chr(64+col_riesgo)}{i}", fmt)
+        # Nivel_de_Riesgo
+        valores_riesgo = df["Nivel_de_Riesgo"].tolist()
+        col_R = col_letter(col_riesgo)
+        for i, v in enumerate(valores_riesgo, start=2):
+            if v == "BAJO": fmt = verde
+            elif v == "MEDIO": fmt = amarillo
+            elif v == "ALTO": fmt = rojo
+            else: fmt = gris
+            format_cell_range(worksheet, f"{col_R}{i}", fmt)
 
-            fmt = verde if dict_v == "DENTRO" else rojo
-            format_cell_range(worksheet, f"{chr(64+col_intervalo)}{i}", fmt)
+        # Dictamen
+        valores_dict = df["Dictamen_por_intervalo"].tolist()
+        col_D = col_letter(col_intervalo)
+        for i, v in enumerate(valores_dict, start=2):
+            fmt = verde if v == "DENTRO" else rojo
+            format_cell_range(worksheet, f"{col_D}{i}", fmt)
 
         return True, nombre_hoja
 
     except Exception as e:
         return False, str(e)
+
 
 
 # ============================================================
