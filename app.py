@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 import os
 from datetime import datetime
-import string
 
 from catboost import CatBoostRegressor, CatBoostClassifier
 
@@ -35,7 +34,7 @@ DEGRADACIONES_FILE = "vida_util_degradacion.csv"
 
 SHEET_URL = st.secrets["sheets"]["url"]
 
-# Inicialización session_state
+# Inicialización de session_state
 if "prediccion_realizada" not in st.session_state:
     st.session_state["prediccion_realizada"] = False
 if "df_pred" not in st.session_state:
@@ -89,6 +88,7 @@ MAPEO_DESCRIPCION = {
     "GEORGE KENT_GKMV40P_VOL_R315_Q3:2,5_DN15_0,02L": "GKMV40P_R315",
 }
 
+
 def obtener_modelo_corto(desc):
     return MAPEO_DESCRIPCION.get(str(desc).strip(), "SIN MODELO")
 
@@ -102,25 +102,37 @@ def cargar_modelos():
     interval_models = {}
     clasif_models = {}
 
+    # Intervalos
     if os.path.isdir(MODELOS_INTERVALOS):
         for file in os.listdir(MODELOS_INTERVALOS):
-            if file.endswith("_lower.cbm") or file.endswith("_upper.cbm"):
-                modelo = file.replace("_lower.cbm","").replace("_upper.cbm","")
-                m = CatBoostRegressor()
-                m.load_model(os.path.join(MODELOS_INTERVALOS,file))
-                interval_models.setdefault(modelo,{})
-                if file.endswith("_lower.cbm"):
-                    interval_models[modelo]["lower"] = m
-                else:
-                    interval_models[modelo]["upper"] = m
+            if not file.endswith(".cbm"):
+                continue
+            path = os.path.join(MODELOS_INTERVALOS, file)
 
+            if file.endswith("_lower.cbm"):
+                modelo = file.replace("_lower.cbm", "")
+                m = CatBoostRegressor()
+                m.load_model(path)
+                interval_models.setdefault(modelo, {})
+                interval_models[modelo]["lower"] = m
+
+            elif file.endswith("_upper.cbm"):
+                modelo = file.replace("_upper.cbm", "")
+                m = CatBoostRegressor()
+                m.load_model(path)
+                interval_models.setdefault(modelo, {})
+                interval_models[modelo]["upper"] = m
+
+    # Clasificación
     if os.path.isdir(MODELOS_CLASIFICACION):
         for file in os.listdir(MODELOS_CLASIFICACION):
-            if file.endswith(".cbm"):
-                modelo = file.replace(".cbm","")
-                m = CatBoostClassifier()
-                m.load_model(os.path.join(MODELOS_CLASIFICACION,file))
-                clasif_models[modelo] = m
+            if not file.endswith(".cbm"):
+                continue
+            path = os.path.join(MODELOS_CLASIFICACION, file)
+            modelo = file.replace(".cbm", "")
+            m = CatBoostClassifier()
+            m.load_model(path)
+            clasif_models[modelo] = m
 
     return interval_models, clasif_models
 
@@ -226,11 +238,32 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
 
 
 # ============================================================
-# EXPORTACIÓN A GOOGLE SHEETS (OPTIMIZADA 5 REQUESTS)
+# SEMÁFORO EN TABLA STREAMLIT
+# ============================================================
+
+def color_semaforo(val):
+    if val == "DENTRO":
+        return "background-color: #d4edda;"
+    if val == "FUERA":
+        return "background-color: #f8d7da;"
+    if val == "CUMPLE":
+        return "background-color: #cce5ff;"
+    if val == "NO CUMPLE":
+        return "background-color: #f8d7da;"
+    if val == "BAJO":
+        return "background-color: #d4edda;"
+    if val == "MEDIO":
+        return "background-color: #fff3cd;"
+    if val == "ALTO":
+        return "background-color: #f8d7da;"
+    return ""
+
+
+# ============================================================
+# EXPORTACIÓN A GOOGLE SHEETS
 # ============================================================
 
 def exportar_google_sheets(df):
-
     try:
         creds_info = st.secrets["gcp_service_account"]
         sheet_id = st.secrets["google_sheets"]["sheet_id"]
@@ -257,55 +290,38 @@ def exportar_google_sheets(df):
         data = [df.columns.tolist()] + df.astype(str).values.tolist()
         worksheet.update(data)
 
-        # =======================================
-        # FORMATO ANTI-429 — SOLO 5 REQUESTS
-        # =======================================
+        col_pred = df.columns.get_loc("Pred_Conformidad") + 1
+        col_riesgo = df.columns.get_loc("Nivel_de_Riesgo") + 1
+        col_intervalo = df.columns.get_loc("Dictamen_por_intervalo") + 1
+
+        n_rows = len(df) + 1
 
         verde = CellFormat(backgroundColor=Color(0.80, 1.00, 0.80))
         rojo = CellFormat(backgroundColor=Color(1.00, 0.80, 0.80))
         amarillo = CellFormat(backgroundColor=Color(1.00, 1.00, 0.60))
         gris = CellFormat(backgroundColor=Color(0.90, 0.90, 0.90))
 
-        col_pred = df.columns.get_loc("Pred_Conformidad") + 1
-        col_riesgo = df.columns.get_loc("Nivel_de_Riesgo") + 1
-        col_intervalo = df.columns.get_loc("Dictamen_por_intervalo") + 1
+        for i in range(2, n_rows + 1):
+            pred_v = df.iloc[i-2]["Pred_Conformidad"]
+            riesgo_v = df.iloc[i-2]["Nivel_de_Riesgo"]
+            dict_v = df.iloc[i-2]["Dictamen_por_intervalo"]
 
-        n_rows = len(df) + 1
-        letras = list(string.ascii_uppercase)
+            fmt = verde if pred_v == "CUMPLE" else rojo
+            format_cell_range(worksheet, f"{chr(64+col_pred)}{i}", fmt)
 
-        col_pred_l = letras[col_pred - 1]
-        col_riesgo_l = letras[col_riesgo - 1]
-        col_intervalo_l = letras[col_intervalo - 1]
+            if riesgo_v == "BAJO":
+                fmt = verde
+            elif riesgo_v == "MEDIO":
+                fmt = amarillo
+            elif riesgo_v == "ALTO":
+                fmt = rojo
+            else:
+                fmt = gris
+            format_cell_range(worksheet, f"{chr(64+col_riesgo)}{i}", fmt)
 
-        # Rangos completos
-        pred_range = f"{col_pred_l}2:{col_pred_l}{n_rows}"
-        riesgo_range = f"{col_riesgo_l}2:{col_riesgo_l}{n_rows}"
-        intervalo_range = f"{col_intervalo_l}2:{col_intervalo_l}{n_rows}"
+            fmt = verde if dict_v == "DENTRO" else rojo
+            format_cell_range(worksheet, f"{chr(64+col_intervalo)}{i}", fmt)
 
-        # === 1) Formatos base por columna
-        format_cell_range(worksheet, pred_range, rojo)
-        format_cell_range(worksheet, riesgo_range, rojo)
-        format_cell_range(worksheet, intervalo_range, rojo)
-
-        # === 2) Corrección de valores específicos (3 requests más)
-        cumple_rows = df.index[df["Pred_Conformidad"] == "CUMPLE"] + 2
-        riesgo_bajo = df.index[df["Nivel_de_Riesgo"] == "BAJO"] + 2
-        riesgo_medio = df.index[df["Nivel_de_Riesgo"] == "MEDIO"] + 2
-        dentro_rows = df.index[df["Dictamen_por_intervalo"] == "DENTRO"] + 2
-
-        for fila in cumple_rows:
-            format_cell_range(worksheet, f"{col_pred_l}{fila}", verde)
-
-        for fila in riesgo_bajo:
-            format_cell_range(worksheet, f"{col_riesgo_l}{fila}", verde)
-
-        for fila in riesgo_medio:
-            format_cell_range(worksheet, f"{col_riesgo_l}{fila}", amarillo)
-
-        for fila in dentro_rows:
-            format_cell_range(worksheet, f"{col_intervalo_l}{fila}", verde)
-
-        # Total de requests ≈ 5–8 (MUY eficiente)
         return True, nombre_hoja
 
     except Exception as e:
@@ -317,7 +333,6 @@ def exportar_google_sheets(df):
 # ============================================================
 
 def main():
-
     st.title("🔮 Sistema Predictivo de Medidores de Agua")
     st.markdown("---")
 
@@ -345,7 +360,7 @@ def main():
         df_base = pd.read_csv(file)
         st.success("Archivo CSV cargado correctamente.")
 
-    st.write("### 🔎 Vista previa de los datos")
+    st.write("### 🔎 Vista previa")
     st.dataframe(df_base.head())
 
     # ===== EJECUTAR PREDICCIÓN =====
@@ -359,9 +374,9 @@ def main():
 
         st.session_state["df_pred"] = df_pred
         st.session_state["prediccion_realizada"] = True
-        st.success("Predicción completada correctamente.")
+        st.success("Predicción completada.")
 
-    # ===== MOSTRAR RESULTADOS =====
+    # Mostrar resultados solo si ya se generó predicción
     if st.session_state["prediccion_realizada"]:
         df_pred = st.session_state["df_pred"]
 
@@ -377,7 +392,7 @@ def main():
                     subset=["Pred_Conformidad", "Dictamen_por_intervalo", "Nivel_de_Riesgo"]
                 )
                 st.dataframe(styled, use_container_width=True)
-            except Exception:
+            except:
                 st.dataframe(df_pred, use_container_width=True)
 
             st.download_button(
@@ -386,14 +401,15 @@ def main():
                 "predicciones_medidores.csv"
             )
 
+            # ===== EXPORTAR GOOGLE SHEETS =====
             st.markdown("### 📤 Exportar a Google Sheets")
 
             if st.button("Enviar a Google Sheets"):
                 ok, msg = exportar_google_sheets(df_pred)
                 if ok:
-                    st.success(f"Predicción exportada correctamente en: {msg}")
+                    st.success(f"Predicción exportada correctamente en la hoja: {msg}")
                 else:
-                    st.error(f"Error al exportar: {msg}")
+                    st.error(f"Error: {msg}")
 
         # ================= DASHBOARD =================
         with tab2:
@@ -404,37 +420,40 @@ def main():
             dentro_emp = (df_pred["Dictamen_por_intervalo"] == "DENTRO").mean() * 100
             cumple = (df_pred["Pred_Conformidad"] == "CUMPLE").mean() * 100
 
-            vida_prom = pd.to_numeric(df_pred["Vida_remanente"], errors="coerce").mean()
+            vida_series = pd.to_numeric(df_pred["Vida_remanente"], errors="coerce")
+            vida_prom = vida_series.mean()
 
-            col1.metric("Dentro del EMP", f"{dentro_emp:.1f}%")
-            col2.metric("CUMPLEN", f"{cumple:.1f}%")
-            col3.metric("Vida útil promedio", f"{vida_prom:.1f} años")
+            col1.metric("Medidores dentro del EMP", f"{dentro_emp:.1f}%")
+            col2.metric("Medidores que CUMPLEN", f"{cumple:.1f}%")
+            col3.metric("Vida remanente promedio", f"{vida_prom:.1f} años")
 
             st.markdown("---")
 
             st.write("### Distribución de riesgo")
             st.bar_chart(
                 df_pred["Nivel_de_Riesgo"].value_counts()
-                .reindex(["BAJO", "MEDIO", "ALTO", "SIN MODELO"]).fillna(0)
+                .reindex(["BAJO", "MEDIO", "ALTO", "SIN MODELO"])
+                .fillna(0)
             )
 
-            st.write("### CUMPLE vs NO CUMPLE")
+            st.write("### Distribución CUMPLE / NO CUMPLE")
             st.bar_chart(df_pred["Pred_Conformidad"].value_counts())
 
-            st.write("### Vida remanente por modelo")
+            st.write("### Vida remanente promedio por modelo")
             vida_mod = (
                 df_pred.assign(Vida=pd.to_numeric(df_pred["Vida_remanente"], errors="coerce"))
                 .groupby("Modelo_corto")["Vida"].mean().sort_values()
             )
             st.bar_chart(vida_mod)
 
-            st.write("### Histograma EQ3_mid (%)")
+            st.write("### Histograma de EQ3_mid (%)")
             eq = pd.to_numeric(df_pred["EQ3_mid (%)"], errors="coerce").dropna()
             if not eq.empty:
                 hist = np.histogram(eq, bins=20)
-                st.bar_chart(pd.DataFrame({"bin": hist[1][:-1], "freq": hist[0]}).set_index("bin"))
+                hist_df = pd.DataFrame({"bin": hist[1][:-1].astype(str), "freq": hist[0]})
+                st.bar_chart(hist_df.set_index("bin"))
             else:
-                st.info("Sin datos válidos para EQ3_mid (%)")
+                st.info("No hay datos válidos para EQ3_mid (%)")
 
 
 if __name__ == "__main__":
