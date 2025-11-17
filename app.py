@@ -14,7 +14,7 @@ from catboost import CatBoostRegressor, CatBoostClassifier
 
 st.set_page_config(page_title="Predicción Medidores", layout="wide")
 
-EMP_Q3 = 3.2            # ≈ 2.67% (CORRECTO)
+EMP_Q3 = 3.2            # ≈ 2.67% (umbral metrológico)
 MAX_YEARS = 15
 
 MODELOS_INTERVALOS = "modelos_intervalos"
@@ -126,7 +126,7 @@ def cargar_modelos():
 
 
 # ============================================================
-# FUNCIÓN DE PREDICCIÓN POR LOTE (CORREGIDA)
+# FUNCIÓN DE PREDICCIÓN POR LOTE
 # ============================================================
 
 def predecir_lote(df, interval_models, clasif_models, df_ic,
@@ -167,6 +167,7 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
 
         prob = None
         pred = "SIN MODELO"
+        riesgo = "SIN MODELO"
 
         if modelo_corto in clasif_models:
 
@@ -189,13 +190,21 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
             prob = float(clasif_models[modelo_corto].predict_proba(X_class)[0, 1])
             pred = "CUMPLE" if prob >= 0.5 else "NO CUMPLE"
 
+            # ===== NIVEL DE RIESGO (SEMÁFORO) =====
+            if prob >= 0.80:
+                riesgo = "BAJO"
+            elif prob >= 0.50:
+                riesgo = "MEDIO"
+            else:
+                riesgo = "ALTO"
+
         # ======================================
-        # 3. VIDA ÚTIL REMANENTE (CORREGIDO)
+        # 3. VIDA ÚTIL REMANENTE
         # ======================================
 
         vida_rem = None
 
-        if modelo_corto in df_ic["Descripción"].values:
+        if "Descripción" in df_ic.columns and modelo_corto in df_ic["Descripción"].values:
 
             degr = float(df_ic.loc[
                 df_ic["Descripción"] == modelo_corto,
@@ -229,11 +238,34 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
             "EQ3_mid (%)": eq3_mid,
             "Probabilidad_Cumple": prob,
             "Pred_Conformidad": pred,
+            "Nivel_de_Riesgo": riesgo,
             "Vida_remanente": vida_rem,
             "Dictamen_por_intervalo": dictamen
         })
 
     return pd.DataFrame(resultados)
+
+
+# ============================================================
+# ESTILO: SEMAFORIZACIÓN EN TABLA
+# ============================================================
+
+def color_semaforo(val):
+    if val == "DENTRO":
+        return "background-color: #d4edda;"  # verde suave
+    if val == "FUERA":
+        return "background-color: #f8d7da;"  # rojo suave
+    if val == "CUMPLE":
+        return "background-color: #cce5ff;"  # azul claro
+    if val == "NO CUMPLE":
+        return "background-color: #f8d7da;"
+    if val == "BAJO":
+        return "background-color: #d4edda;"
+    if val == "MEDIO":
+        return "background-color: #fff3cd;"
+    if val == "ALTO":
+        return "background-color: #f8d7da;"
+    return ""
 
 
 # ============================================================
@@ -251,6 +283,7 @@ def main():
 
     df_ic = pd.read_csv(DEGRADACIONES_FILE)
 
+    # ----------------- CARGA DE DATOS -----------------
     if opcion == "Google Sheets":
         try:
             if SHEET_URL.endswith("output=xlsx"):
@@ -277,6 +310,7 @@ def main():
     st.write("### 🔎 Vista previa")
     st.dataframe(df_base.head())
 
+    # ----------------- PREDICCIÓN -----------------
     if st.button("🚀 Ejecutar Predicción"):
         df_pred = predecir_lote(df_base, interval_models, clasif_models, df_ic)
 
@@ -285,15 +319,105 @@ def main():
             return
 
         st.success("Predicción completada.")
-        st.dataframe(df_pred)
 
-        st.download_button(
-            "📥 Descargar CSV",
-            df_pred.to_csv(index=False),
-            "predicciones_medidores.csv",
-            "text/csv"
-        )
+        # Pestañas: Resultados y Dashboard
+        tab1, tab2 = st.tabs(["📄 Resultados", "📊 Dashboard"])
+
+        # ==================== TABLA + SEMÁFORO ====================
+        with tab1:
+            st.write("### 📊 Resultados detallados")
+
+            # Tabla con estilos
+            try:
+                styled = df_pred.style.applymap(
+                    color_semaforo,
+                    subset=["Pred_Conformidad", "Dictamen_por_intervalo", "Nivel_de_Riesgo"]
+                )
+                st.dataframe(styled, use_container_width=True)
+            except Exception:
+                # Si hay algún problema con Styler, mostramos la tabla normal
+                st.dataframe(df_pred, use_container_width=True)
+
+            st.download_button(
+                "📥 Descargar CSV",
+                df_pred.to_csv(index=False),
+                "predicciones_medidores.csv",
+                "text/csv"
+            )
+
+        # ==================== DASHBOARD ====================
+        with tab2:
+            st.write("### 🧮 Indicadores globales")
+
+            col1, col2, col3 = st.columns(3)
+
+            # Medidores dentro del EMP
+            dentro_emp = (df_pred["Dictamen_por_intervalo"] == "DENTRO").mean()
+            dentro_emp = dentro_emp * 100 if not np.isnan(dentro_emp) else 0
+
+            # Medidores que cumplen
+            cumple = (df_pred["Pred_Conformidad"] == "CUMPLE").mean()
+            cumple = cumple * 100 if not np.isnan(cumple) else 0
+
+            # Vida remanente promedio
+            vida_series = pd.to_numeric(df_pred["Vida_remanente"], errors="coerce")
+            vida_prom = vida_series.mean() if not vida_series.empty else np.nan
+
+            with col1:
+                st.metric("Medidores dentro del EMP", f"{dentro_emp:.1f}%")
+            with col2:
+                st.metric("Medidores que CUMPLEN", f"{cumple:.1f}%")
+            with col3:
+                if np.isnan(vida_prom):
+                    st.metric("Vida remanente promedio", "N/D")
+                else:
+                    st.metric("Vida remanente promedio", f"{vida_prom:.1f} años")
+
+            st.markdown("---")
+            st.write("### Distribución de riesgo")
+
+            if "Nivel_de_Riesgo" in df_pred.columns:
+                riesgo_counts = df_pred["Nivel_de_Riesgo"].value_counts().reindex(
+                    ["BAJO", "MEDIO", "ALTO", "SIN MODELO"]
+                ).fillna(0)
+                st.bar_chart(riesgo_counts)
+            else:
+                st.info("No se encontró la columna 'Nivel_de_Riesgo'.")
+
+            st.markdown("### Distribución CUMPLE / NO CUMPLE")
+            if "Pred_Conformidad" in df_pred.columns:
+                cumple_counts = df_pred["Pred_Conformidad"].value_counts()
+                st.bar_chart(cumple_counts)
+            else:
+                st.info("No se encontró la columna 'Pred_Conformidad'.")
+
+            st.markdown("### Vida remanente promedio por modelo")
+            if "Modelo_corto" in df_pred.columns and "Vida_remanente" in df_pred.columns:
+                df_vida_modelo = (
+                    df_pred
+                    .assign(Vida_remanente_num=pd.to_numeric(df_pred["Vida_remanente"], errors="coerce"))
+                    .groupby("Modelo_corto")["Vida_remanente_num"]
+                    .mean()
+                    .sort_values()
+                )
+                st.bar_chart(df_vida_modelo)
+            else:
+                st.info("No se puede calcular la vida remanente por modelo.")
+
+            st.markdown("### Histograma de EQ3_mid (%)")
+            if "EQ3_mid (%)" in df_pred.columns:
+                eq = pd.to_numeric(df_pred["EQ3_mid (%)"], errors="coerce").dropna()
+                if not eq.empty:
+                    # Usamos value_counts por bins para evitar importar matplotlib
+                    hist = np.histogram(eq, bins=20)
+                    hist_df = pd.DataFrame({"bin": hist[1][:-1].astype(str), "freq": hist[0]})
+                    st.bar_chart(hist_df.set_index("bin"))
+                else:
+                    st.info("No hay datos válidos de EQ3_mid (%).")
+            else:
+                st.info("No se encontró la columna 'EQ3_mid (%)'.")
 
 
 if __name__ == "__main__":
     main()
+
