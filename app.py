@@ -14,7 +14,7 @@ from catboost import CatBoostRegressor, CatBoostClassifier
 
 st.set_page_config(page_title="Predicción Medidores", layout="wide")
 
-EMP_Q3 = 4
+EMP_Q3 = 4 - (4/3)            # ≈ 2.67% (CORRECTO)
 MAX_YEARS = 15
 
 MODELOS_INTERVALOS = "modelos_intervalos"
@@ -134,13 +134,6 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
 
     resultados = []
 
-    columnas_necesarias = ["Descripción", "Edad", "Volumen", "Consumo_anual", "Qminimo", "Qtransicion", "Estado"]
-    faltantes = [c for c in columnas_necesarias if c not in df.columns]
-
-    if faltantes:
-        st.error(f"Faltan columnas requeridas: {faltantes}")
-        return pd.DataFrame()
-
     for _, row in df.iterrows():
 
         modelo_corto = obtener_modelo_corto(row["Descripción"])
@@ -152,25 +145,25 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
         qtrans = safe_float(row["Qtransicion"])
         estado = str(row["Estado"])
 
-        # ============================
-        # 1. INTERVALOS
-        # ============================
+        # ======================================
+        # 1. INTERVALOS EQ3
+        # ======================================
 
         eq3_low = eq3_high = eq3_mid = None
 
         if modelo_corto in interval_models:
-            m_interval = interval_models[modelo_corto]
+            m_int = interval_models[modelo_corto]
 
-            if "lower" in m_interval and "upper" in m_interval:
+            if "lower" in m_int and "upper" in m_int:
                 X_pred = pd.DataFrame([[edad, volumen, consumo]],
                                       columns=["Edad", "Volumen", "Consumo_anual"])
-                eq3_low = float(m_interval["lower"].predict(X_pred)[0])
-                eq3_high = float(m_interval["upper"].predict(X_pred)[0])
+                eq3_low = float(m_int["lower"].predict(X_pred)[0])
+                eq3_high = float(m_int["upper"].predict(X_pred)[0])
                 eq3_mid = (eq3_low + eq3_high) / 2.0
 
-        # ============================
-        # 2. CLASIFICACIÓN (CORREGIDO)
-        # ============================
+        # ======================================
+        # 2. CLASIFICACIÓN CatBoost
+        # ======================================
 
         prob = None
         pred = "SIN MODELO"
@@ -179,48 +172,53 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
 
             features_modelo = clasif_models[modelo_corto].feature_names_
 
-            # Construir diccionario con TODAS las columnas posibles
             row_dict = {
                 "Edad": edad,
                 "Volumen": volumen,
                 "Qminimo": qmin,
                 "Qtransicion": qtrans,
-                "Estado": estado,        # la columna faltante que causaba error
-                "Consumo_anual": consumo # por si el modelo la necesita
+                "Estado": estado,
+                "Consumo_anual": consumo,
             }
 
-            # Construir DataFrame siguiendo EL ORDEN EXACTO del modelo
             X_class = pd.DataFrame(
                 [[row_dict[f] for f in features_modelo]],
                 columns=features_modelo
             )
 
-            p = clasif_models[modelo_corto].predict_proba(X_class)[0, 1]
-            prob = float(p)
+            prob = float(clasif_models[modelo_corto].predict_proba(X_class)[0, 1])
             pred = "CUMPLE" if prob >= 0.5 else "NO CUMPLE"
 
-        # ============================
-        # 3. VIDA ÚTIL
-        # ============================
+        # ======================================
+        # 3. VIDA ÚTIL REMANENTE (CORREGIDO)
+        # ======================================
 
         vida_rem = None
-        dictamen = "SIN MODELO"
 
-        if (eq3_mid is not None) and \
-           ("Descripción" in df_ic.columns) and \
-           ("Degradación_media (%)" in df_ic.columns):
+        if modelo_corto in df_ic["Descripción"].values:
 
-            if modelo_corto in df_ic["Descripción"].values:
-                degr = float(df_ic.loc[df_ic["Descripción"] == modelo_corto,
-                                       "Degradación_media (%)"].values[0])
+            degr = float(df_ic.loc[
+                df_ic["Descripción"] == modelo_corto,
+                "Degradación_media (%)"
+            ].values[0])
 
-                if degr != 0:
-                    t1 = (emp - eq3_mid) / degr
-                    t2 = (-emp - eq3_mid) / degr
-                    valid = [t for t in [t1, t2] if t >= 0]
-                    vida_rem = min(valid) if valid else max_years
+            eq0 = eq3_mid
 
-        if eq3_mid is not None:
+            if eq0 is None or abs(eq0) >= emp or degr == 0:
+                vida_rem = 0
+            else:
+                t1 = (emp - eq0) / degr
+                t2 = (-emp - eq0) / degr
+                valid = [t for t in (t1, t2) if t >= 0]
+                vida_rem = min(valid) if valid else max_years
+
+        # ======================================
+        # 4. DICTAMEN
+        # ======================================
+
+        if eq3_mid is None:
+            dictamen = "SIN MODELO"
+        else:
             dictamen = "FUERA" if abs(eq3_mid) > emp else "DENTRO"
 
         resultados.append({
