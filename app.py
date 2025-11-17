@@ -34,6 +34,12 @@ DEGRADACIONES_FILE = "vida_util_degradacion.csv"
 
 SHEET_URL = st.secrets["sheets"]["url"]
 
+# Inicialización de session_state
+if "prediccion_realizada" not in st.session_state:
+    st.session_state["prediccion_realizada"] = False
+if "df_pred" not in st.session_state:
+    st.session_state["df_pred"] = None
+
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -51,7 +57,6 @@ def safe_float(x):
         return 0.0
 
 
-# Mapeo de descripciones → modelos
 MAPEO_DESCRIPCION = {
     "ELSTER_V100_Vol_R160_15mm_0.01 (H)": "GB1_R160",
     "ELSTER_GB1_VOL_R160_Q3:2,5_DN15_0,01L": "GB1_R160",
@@ -255,7 +260,7 @@ def color_semaforo(val):
 
 
 # ============================================================
-# EXPORTACIÓN A GOOGLE SHEETS (CON SEMÁFORO)
+# EXPORTACIÓN A GOOGLE SHEETS
 # ============================================================
 
 def exportar_google_sheets(df):
@@ -285,30 +290,25 @@ def exportar_google_sheets(df):
         data = [df.columns.tolist()] + df.astype(str).values.tolist()
         worksheet.update(data)
 
-        # Columnas a colorear
         col_pred = df.columns.get_loc("Pred_Conformidad") + 1
         col_riesgo = df.columns.get_loc("Nivel_de_Riesgo") + 1
         col_intervalo = df.columns.get_loc("Dictamen_por_intervalo") + 1
 
         n_rows = len(df) + 1
 
-        # Colores
         verde = CellFormat(backgroundColor=Color(0.80, 1.00, 0.80))
         rojo = CellFormat(backgroundColor=Color(1.00, 0.80, 0.80))
         amarillo = CellFormat(backgroundColor=Color(1.00, 1.00, 0.60))
         gris = CellFormat(backgroundColor=Color(0.90, 0.90, 0.90))
 
-        # ===== FORMATO POR FILA =====
         for i in range(2, n_rows + 1):
             pred_v = df.iloc[i-2]["Pred_Conformidad"]
             riesgo_v = df.iloc[i-2]["Nivel_de_Riesgo"]
             dict_v = df.iloc[i-2]["Dictamen_por_intervalo"]
 
-            # Col Predict
             fmt = verde if pred_v == "CUMPLE" else rojo
             format_cell_range(worksheet, f"{chr(64+col_pred)}{i}", fmt)
 
-            # Col Riesgo
             if riesgo_v == "BAJO":
                 fmt = verde
             elif riesgo_v == "MEDIO":
@@ -319,7 +319,6 @@ def exportar_google_sheets(df):
                 fmt = gris
             format_cell_range(worksheet, f"{chr(64+col_riesgo)}{i}", fmt)
 
-            # Col Dictamen
             fmt = verde if dict_v == "DENTRO" else rojo
             format_cell_range(worksheet, f"{chr(64+col_intervalo)}{i}", fmt)
 
@@ -373,7 +372,13 @@ def main():
             st.error("No se pudieron generar predicciones.")
             return
 
+        st.session_state["df_pred"] = df_pred
+        st.session_state["prediccion_realizada"] = True
         st.success("Predicción completada.")
+
+    # Mostrar resultados solo si ya se generó predicción
+    if st.session_state["prediccion_realizada"]:
+        df_pred = st.session_state["df_pred"]
 
         tab1, tab2 = st.tabs(["📄 Resultados", "📊 Dashboard"])
 
@@ -412,13 +417,9 @@ def main():
 
             col1, col2, col3 = st.columns(3)
 
-            # EMP
             dentro_emp = (df_pred["Dictamen_por_intervalo"] == "DENTRO").mean() * 100
-
-            # CUMPLE
             cumple = (df_pred["Pred_Conformidad"] == "CUMPLE").mean() * 100
 
-            # Vida útil
             vida_series = pd.to_numeric(df_pred["Vida_remanente"], errors="coerce")
             vida_prom = vida_series.mean()
 
@@ -428,7 +429,6 @@ def main():
 
             st.markdown("---")
 
-            # ===== Riesgo =====
             st.write("### Distribución de riesgo")
             st.bar_chart(
                 df_pred["Nivel_de_Riesgo"].value_counts()
@@ -436,11 +436,9 @@ def main():
                 .fillna(0)
             )
 
-            # ===== Conformidad =====
             st.write("### Distribución CUMPLE / NO CUMPLE")
             st.bar_chart(df_pred["Pred_Conformidad"].value_counts())
 
-            # ===== Vida por modelo =====
             st.write("### Vida remanente promedio por modelo")
             vida_mod = (
                 df_pred.assign(Vida=pd.to_numeric(df_pred["Vida_remanente"], errors="coerce"))
@@ -448,7 +446,6 @@ def main():
             )
             st.bar_chart(vida_mod)
 
-            # ===== EQ3 mid =====
             st.write("### Histograma de EQ3_mid (%)")
             eq = pd.to_numeric(df_pred["EQ3_mid (%)"], errors="coerce").dropna()
             if not eq.empty:
@@ -461,5 +458,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
