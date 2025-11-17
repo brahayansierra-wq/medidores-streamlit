@@ -14,7 +14,7 @@ from catboost import CatBoostRegressor, CatBoostClassifier
 
 st.set_page_config(page_title="Predicción Medidores", layout="wide")
 
-EMP_Q3 = 4 - (4/3)            # ≈ 2.67% (CORRECTO)
+EMP_Q3 = 3.2            # ≈ 2.67% (CORRECTO)
 MAX_YEARS = 15
 
 MODELOS_INTERVALOS = "modelos_intervalos"
