@@ -1,5 +1,5 @@
 ###############################################################
-#                     STREAMLIT — PREDICCIÓN MEDIDORES
+#              STREAMLIT — PREDICCIÓN MEDIDORES DE AGUA
 ###############################################################
 
 import streamlit as st
@@ -9,29 +9,38 @@ import os
 from catboost import CatBoostRegressor, CatBoostClassifier
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # ============================================================
-
-EMP_Q3 = 4 #- (4/3)   # ≈ 2.67%
-MAX_YEARS = 15      
-SHEET_URL = st.secrets["https://docs.google.com/spreadsheets/d/e/2PACX-1vTh6UM90hkGvj-aqIByeP7MClXR_kjkt2EmIwF_vuMwkFyvLyuG2YTtotwG0A_GaYa8B7hIC0f4SLox/pub?output=xlsx"]   # ⚠ ENSÉÑAME ESTE VALOR
-MODELS_PATH = "modelos"                       # Carpeta con .cbm
-DEGRADACIONES_FILE = "vida_util_degradacion.csv"
 
 st.set_page_config(page_title="Predicción Medidores", layout="wide")
 
+EMP_Q3 = 4          # Umbral de EQ3
+MAX_YEARS = 15      # Vida útil máxima simulable
+
+# Rutas de modelos (según repositorio real)
+MODELOS_INTERVALOS = "modelos_intervalos"
+MODELOS_CLASIFICACION = "modelos_clasificacion"
+
+# Archivo local
+DEGRADACIONES_FILE = "vida_util_degradacion.csv"
+
+# Google Sheets URL (desde secrets.toml)
+SHEET_URL = st.secrets["sheets"]["url"]
+
+
 # ============================================================
-# SAFE FLOAT
+# FUNCIONES AUXILIARES
 # ============================================================
 
 def safe_float(x):
+    """Convierte valores a float de forma segura, limpiando símbolos comunes."""
     try:
         if isinstance(x, list):
             x = x[0]
 
         x = str(x).replace(",", "").replace("%", "").strip()
 
-        if x in ["", "None", "nan", "-", "--"]:
+        if x in ["", "None", "nan", "NaN", "-", "--"]:
             return 0.0
 
         return float(x)
@@ -39,10 +48,7 @@ def safe_float(x):
         return 0.0
 
 
-# ============================================================
-# MAPEO DE DESCRIPCIÓN LARGA → MODELO CORTO
-# ============================================================
-
+# Mapeo entre Descripción → ModeLo corto
 MAPEO_DESCRIPCION = {
     # GB1_R160
     "ELSTER_V100_Vol_R160_15mm_0.01 (H)": "GB1_R160",
@@ -83,12 +89,13 @@ MAPEO_DESCRIPCION = {
     "GEORGE KENT_GKMV40P_VOL_R315_Q3:2,5_DN15_0,02L": "GKMV40P_R315",
 }
 
+
 def obtener_modelo_corto(desc):
     return MAPEO_DESCRIPCION.get(str(desc).strip(), "SIN MODELO")
 
 
 # ============================================================
-# CARGA DE MODELOS
+# CARGA DE MODELOS CATBOOST
 # ============================================================
 
 @st.cache_resource
@@ -96,77 +103,128 @@ def cargar_modelos():
     interval_models = {}
     clasif_models = {}
 
-    for file in os.listdir(MODELS_PATH):
-        path = os.path.join(MODELS_PATH, file)
+    # -----------------------------
+    # 1. Modelos de intervalos
+    # -----------------------------
+    if os.path.isdir(MODELOS_INTERVALOS):
+        for file in os.listdir(MODELOS_INTERVALOS):
+            if not file.endswith(".cbm"):
+                continue
 
-        if file.endswith("_lower.cbm"):
-            modelo = file.replace("_lower.cbm", "")
-            interval_models.setdefault(modelo, {})
-            interval_models[modelo]["lower"] = CatBoostRegressor().load_model(path)
+            path = os.path.join(MODELOS_INTERVALOS, file)
 
-        elif file.endswith("_upper.cbm"):
-            modelo = file.replace("_upper.cbm", "")
-            interval_models.setdefault(modelo, {})
-            interval_models[modelo]["upper"] = CatBoostRegressor().load_model(path)
+            if file.endswith("_lower.cbm"):
+                modelo = file.replace("_lower.cbm", "")
+                interval_models.setdefault(modelo, {})
+                m = CatBoostRegressor()
+                m.load_model(path)
+                interval_models[modelo]["lower"] = m
 
-        elif file.endswith(".cbm"):
+            elif file.endswith("_upper.cbm"):
+                modelo = file.replace("_upper.cbm", "")
+                interval_models.setdefault(modelo, {})
+                m = CatBoostRegressor()
+                m.load_model(path)
+                interval_models[modelo]["upper"] = m
+
+    else:
+        st.warning(f"No existe la carpeta {MODELOS_INTERVALOS}")
+
+    # -----------------------------
+    # 2. Modelos de clasificación
+    # -----------------------------
+    if os.path.isdir(MODELOS_CLASIFICACION):
+        for file in os.listdir(MODELOS_CLASIFICACION):
+            if not file.endswith(".cbm"):
+                continue
+
+            path = os.path.join(MODELOS_CLASIFICACION, file)
             modelo = file.replace(".cbm", "")
-            clasif_models[modelo] = CatBoostClassifier().load_model(path)
+
+            m = CatBoostClassifier()
+            m.load_model(path)
+            clasif_models[modelo] = m
+    else:
+        st.warning(f"No existe la carpeta {MODELOS_CLASIFICACION}")
 
     return interval_models, clasif_models
 
 
 # ============================================================
-# PREDICCIÓN
+# FUNCIÓN DE PREDICCIÓN POR LOTE
 # ============================================================
 
-def predecir_lote(df, interval_models, clasif_models, df_ic, emp=EMP_Q3, max_years=MAX_YEARS):
+def predecir_lote(df, interval_models, clasif_models, df_ic,
+                  emp=EMP_Q3, max_years=MAX_YEARS):
 
     resultados = []
 
+    columnas_necesarias = ["Descripción", "Edad", "Volumen", "Consumo_anual", "Qminimo", "Qtransicion"]
+    faltantes = [c for c in columnas_necesarias if c not in df.columns]
+
+    if faltantes:
+        st.error(f"Faltan columnas en el archivo de entrada: {faltantes}")
+        return pd.DataFrame()
+
     for _, row in df.iterrows():
+
         modelo_corto = obtener_modelo_corto(row["Descripción"])
 
-        edad = safe_float(row.get("Edad"))
-        volumen = safe_float(row.get("Volumen"))
-        consumo = safe_float(row.get("Consumo_anual"))
-        qmin = safe_float(row.get("Qminimo"))
-        qtrans = safe_float(row.get("Qtransicion"))
+        edad = safe_float(row["Edad"])
+        volumen = safe_float(row["Volumen"])
+        consumo = safe_float(row["Consumo_anual"])
+        qmin = safe_float(row["Qminimo"])
+        qtrans = safe_float(row["Qtransicion"])
 
-        # 1. Predicción intervalos
+        # -------------------------
+        # 1. Intervalos EQ3
+        # -------------------------
+        eq3_low = eq3_high = eq3_mid = None
+
         if modelo_corto in interval_models:
-            X_pred = pd.DataFrame([[edad, volumen, consumo]],
-                                  columns=["Edad", "Volumen", "Consumo_anual"])
-            eq3_low = interval_models[modelo_corto]["lower"].predict(X_pred)[0]
-            eq3_high = interval_models[modelo_corto]["upper"].predict(X_pred)[0]
-            eq3_mid = (eq3_low + eq3_high) / 2
-        else:
-            eq3_low = eq3_high = eq3_mid = None
+            m_interval = interval_models[modelo_corto]
 
+            if "lower" in m_interval and "upper" in m_interval:
+                X_pred = pd.DataFrame([[edad, volumen, consumo]],
+                                      columns=["Edad", "Volumen", "Consumo_anual"])
+                eq3_low = float(m_interval["lower"].predict(X_pred)[0])
+                eq3_high = float(m_interval["upper"].predict(X_pred)[0])
+                eq3_mid = (eq3_low + eq3_high) / 2.0
+
+        # -------------------------
         # 2. Clasificación
+        # -------------------------
+        prob = None
+        pred = "SIN MODELO"
+
         if modelo_corto in clasif_models:
             X_class = pd.DataFrame([[edad, volumen, qmin, qtrans]],
                                    columns=["Edad", "Volumen", "Qminimo", "Qtransicion"])
-            prob = clasif_models[modelo_corto].predict_proba(X_class)[0,1]
+            p = clasif_models[modelo_corto].predict_proba(X_class)[0, 1]
+            prob = float(p)
             pred = "CUMPLE" if prob >= 0.5 else "NO CUMPLE"
-        else:
-            prob = None
-            pred = "SIN MODELO"
 
+        # -------------------------
         # 3. Vida útil
+        # -------------------------
         vida_rem = None
-        if eq3_mid is not None and modelo_corto in df_ic["Descripción"].values:
-            degr = float(df_ic.loc[df_ic["Descripción"] == modelo_corto, "Degradación_media (%)"].values[0])
-            if degr != 0:
-                t1 = (emp - eq3_mid) / degr
-                t2 = (-emp - eq3_mid) / degr
-                valid = [t for t in [t1, t2] if t >= 0]
-                vida_rem = min(valid) if valid else max_years
+        dictamen = "SIN MODELO"
 
-        # Dictamen
-        if eq3_mid is None:
-            dictamen = "SIN MODELO"
-        else:
+        if (eq3_mid is not None) and \
+           ("Descripción" in df_ic.columns) and \
+           ("Degradación_media (%)" in df_ic.columns):
+
+            if modelo_corto in df_ic["Descripción"].values:
+                degr = float(df_ic.loc[df_ic["Descripción"] == modelo_corto,
+                                       "Degradación_media (%)"].values[0])
+
+                if degr != 0:
+                    t1 = (emp - eq3_mid) / degr
+                    t2 = (-emp - eq3_mid) / degr
+                    valid = [t for t in [t1, t2] if t >= 0]
+                    vida_rem = min(valid) if valid else max_years
+
+        if eq3_mid is not None:
             dictamen = "FUERA" if abs(eq3_mid) > emp else "DENTRO"
 
         resultados.append({
@@ -174,6 +232,7 @@ def predecir_lote(df, interval_models, clasif_models, df_ic, emp=EMP_Q3, max_yea
             "Modelo_corto": modelo_corto,
             "EQ3_lower (%)": eq3_low,
             "EQ3_upper (%)": eq3_high,
+            "EQ3_mid (%)": eq3_mid,
             "Probabilidad_Cumple": prob,
             "Pred_Conformidad": pred,
             "Vida_remanente": vida_rem,
@@ -184,56 +243,81 @@ def predecir_lote(df, interval_models, clasif_models, df_ic, emp=EMP_Q3, max_yea
 
 
 # ============================================================
-# INTERFAZ STREAMLIT
+# INTERFAZ PRINCIPAL STREAMLIT
 # ============================================================
 
 def main():
+
     st.title("🔮 Sistema Predictivo de Medidores de Agua — CatBoost + Intervalos")
+    st.markdown("---")
 
-    st.sidebar.header("⚙ Configuración")
-
-    # 1. Cargar modelos
-    interval_models, clasif_models = cargar_modelos()
-
-    # 2. Cargar degradaciones
-    df_ic = pd.read_csv(DEGRADACIONES_FILE)
-
-    # 3. Selección de fuente de datos
     opcion = st.sidebar.radio("Fuente de datos:", ["Google Sheets", "Subir archivo CSV"])
 
+    # Cargar modelos
+    interval_models, clasif_models = cargar_modelos()
+
+    # Archivo de degradación
+    df_ic = pd.read_csv(DEGRADACIONES_FILE)
+
+    # ----------------------------
+    # Entrada: Google Sheets
+    # ----------------------------
     if opcion == "Google Sheets":
+        st.subheader("📥 Datos desde Google Sheets")
+
         try:
-            df_base = pd.read_csv(SHEET_URL)
+            if SHEET_URL.endswith("output=xlsx"):
+                df_base = pd.read_excel(SHEET_URL)
+            else:
+                df_base = pd.read_csv(SHEET_URL)
+
             st.success("Google Sheets cargado correctamente.")
-        except:
-            st.error("Error cargando Google Sheets.")
+
+        except Exception as e:
+            st.error(f"Error cargando Google Sheets: {e}")
             return
 
+    # ----------------------------
+    # Entrada: archivo CSV local
+    # ----------------------------
     else:
-        file = st.file_uploader("Sube un archivo CSV")
-        if file:
-            df_base = pd.read_csv(file)
-        else:
-            st.info("Sube un archivo para continuar.")
+        st.subheader("📥 Subir archivo CSV")
+        file = st.file_uploader("Selecciona un archivo CSV", type=["csv"])
+
+        if file is None:
+            st.info("Sube un archivo CSV para continuar.")
             return
 
-    st.write("### 📄 Vista previa de datos")
+        try:
+            df_base = pd.read_csv(file)
+            st.success("Archivo cargado correctamente.")
+        except Exception as e:
+            st.error(f"Error leyendo CSV: {e}")
+            return
+
+    # Vista previa
+    st.write("### 🔎 Vista previa")
     st.dataframe(df_base.head())
 
+    # Botón de predicción
     if st.button("🚀 Ejecutar Predicción"):
         df_pred = predecir_lote(df_base, interval_models, clasif_models, df_ic)
-        st.success("Predicción completada.")
 
+        if df_pred.empty:
+            st.error("No fue posible generar resultados.")
+            return
+
+        st.success("Predicción completada.")
         st.write("### 📊 Resultados")
         st.dataframe(df_pred)
 
         st.download_button(
-            label="📥 Descargar resultados",
-            data=df_pred.to_csv(index=False),
-            file_name="predicciones_medidores.csv"
+            "📥 Descargar CSV",
+            df_pred.to_csv(index=False),
+            "predicciones_medidores.csv",
+            "text/csv"
         )
 
 
 if __name__ == "__main__":
     main()
-
