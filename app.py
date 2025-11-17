@@ -6,7 +6,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+from datetime import datetime
+
 from catboost import CatBoostRegressor, CatBoostClassifier
+
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread_formatting import (
+    format_cell_range,
+    CellFormat,
+    Color
+)
 
 # ============================================================
 # CONFIG GENERAL
@@ -14,7 +24,7 @@ from catboost import CatBoostRegressor, CatBoostClassifier
 
 st.set_page_config(page_title="Predicción Medidores", layout="wide")
 
-EMP_Q3 = 3.2            # ≈ 2.67% (umbral metrológico)
+EMP_Q3 = 4 - (4/3)  # ≈ 2.67%
 MAX_YEARS = 15
 
 MODELOS_INTERVALOS = "modelos_intervalos"
@@ -22,8 +32,8 @@ MODELOS_CLASIFICACION = "modelos_clasificacion"
 
 DEGRADACIONES_FILE = "vida_util_degradacion.csv"
 
-# Google Sheets URL desde secrets
 SHEET_URL = st.secrets["sheets"]["url"]
+
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -33,17 +43,15 @@ def safe_float(x):
     try:
         if isinstance(x, list):
             x = x[0]
-
         x = str(x).replace(",", "").replace("%", "").strip()
-
-        if x in ["", "None", "nan", "NaN", "-", "--"]:
+        if x in ["", "None", "nan", "-", "--"]:
             return 0.0
-
         return float(x)
     except:
         return 0.0
 
 
+# Mapeo de descripciones → modelos
 MAPEO_DESCRIPCION = {
     "ELSTER_V100_Vol_R160_15mm_0.01 (H)": "GB1_R160",
     "ELSTER_GB1_VOL_R160_Q3:2,5_DN15_0,01L": "GB1_R160",
@@ -75,6 +83,7 @@ MAPEO_DESCRIPCION = {
     "GEORGE KENT_GKMV40P_VOL_R315_Q3:2,5_DN15_0,02L": "GKMV40P_R315",
 }
 
+
 def obtener_modelo_corto(desc):
     return MAPEO_DESCRIPCION.get(str(desc).strip(), "SIN MODELO")
 
@@ -88,12 +97,11 @@ def cargar_modelos():
     interval_models = {}
     clasif_models = {}
 
-    # MODELOS DE INTERVALOS
+    # Intervalos
     if os.path.isdir(MODELOS_INTERVALOS):
         for file in os.listdir(MODELOS_INTERVALOS):
             if not file.endswith(".cbm"):
                 continue
-
             path = os.path.join(MODELOS_INTERVALOS, file)
 
             if file.endswith("_lower.cbm"):
@@ -110,12 +118,11 @@ def cargar_modelos():
                 interval_models.setdefault(modelo, {})
                 interval_models[modelo]["upper"] = m
 
-    # MODELOS DE CLASIFICACIÓN
+    # Clasificación
     if os.path.isdir(MODELOS_CLASIFICACION):
         for file in os.listdir(MODELOS_CLASIFICACION):
             if not file.endswith(".cbm"):
                 continue
-
             path = os.path.join(MODELOS_CLASIFICACION, file)
             modelo = file.replace(".cbm", "")
             m = CatBoostClassifier()
@@ -126,7 +133,7 @@ def cargar_modelos():
 
 
 # ============================================================
-# FUNCIÓN DE PREDICCIÓN POR LOTE
+# FUNCIÓN DE PREDICCIÓN
 # ============================================================
 
 def predecir_lote(df, interval_models, clasif_models, df_ic,
@@ -145,52 +152,40 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
         qtrans = safe_float(row["Qtransicion"])
         estado = str(row["Estado"])
 
-        # ======================================
-        # 1. INTERVALOS EQ3
-        # ======================================
-
+        # ===== INTERVALOS =====
         eq3_low = eq3_high = eq3_mid = None
 
         if modelo_corto in interval_models:
-            m_int = interval_models[modelo_corto]
+            m = interval_models[modelo_corto]
+            if "lower" in m and "upper" in m:
+                Xp = pd.DataFrame([[edad, volumen, consumo]],
+                                  columns=["Edad", "Volumen", "Consumo_anual"])
+                eq3_low = float(m["lower"].predict(Xp)[0])
+                eq3_high = float(m["upper"].predict(Xp)[0])
+                eq3_mid = (eq3_low + eq3_high) / 2
 
-            if "lower" in m_int and "upper" in m_int:
-                X_pred = pd.DataFrame([[edad, volumen, consumo]],
-                                      columns=["Edad", "Volumen", "Consumo_anual"])
-                eq3_low = float(m_int["lower"].predict(X_pred)[0])
-                eq3_high = float(m_int["upper"].predict(X_pred)[0])
-                eq3_mid = (eq3_low + eq3_high) / 2.0
-
-        # ======================================
-        # 2. CLASIFICACIÓN CatBoost
-        # ======================================
-
+        # ===== CLASIFICACIÓN =====
         prob = None
         pred = "SIN MODELO"
         riesgo = "SIN MODELO"
 
         if modelo_corto in clasif_models:
+            features = clasif_models[modelo_corto].feature_names_
 
-            features_modelo = clasif_models[modelo_corto].feature_names_
-
-            row_dict = {
+            fila = {
                 "Edad": edad,
                 "Volumen": volumen,
+                "Consumo_anual": consumo,
                 "Qminimo": qmin,
                 "Qtransicion": qtrans,
-                "Estado": estado,
-                "Consumo_anual": consumo,
+                "Estado": estado
             }
 
-            X_class = pd.DataFrame(
-                [[row_dict[f] for f in features_modelo]],
-                columns=features_modelo
-            )
-
+            X_class = pd.DataFrame([[fila[f] for f in features]], columns=features)
             prob = float(clasif_models[modelo_corto].predict_proba(X_class)[0, 1])
+
             pred = "CUMPLE" if prob >= 0.5 else "NO CUMPLE"
 
-            # ===== NIVEL DE RIESGO (SEMÁFORO) =====
             if prob >= 0.80:
                 riesgo = "BAJO"
             elif prob >= 0.50:
@@ -198,18 +193,12 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
             else:
                 riesgo = "ALTO"
 
-        # ======================================
-        # 3. VIDA ÚTIL REMANENTE
-        # ======================================
-
+        # ===== VIDA REMANENTE =====
         vida_rem = None
 
         if "Descripción" in df_ic.columns and modelo_corto in df_ic["Descripción"].values:
-
-            degr = float(df_ic.loc[
-                df_ic["Descripción"] == modelo_corto,
-                "Degradación_media (%)"
-            ].values[0])
+            degr = float(df_ic.loc[df_ic["Descripción"] == modelo_corto,
+                                   "Degradación_media (%)"].values[0])
 
             eq0 = eq3_mid
 
@@ -221,10 +210,7 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
                 valid = [t for t in (t1, t2) if t >= 0]
                 vida_rem = min(valid) if valid else max_years
 
-        # ======================================
-        # 4. DICTAMEN
-        # ======================================
-
+        # ===== DICTAMEN =====
         if eq3_mid is None:
             dictamen = "SIN MODELO"
         else:
@@ -247,16 +233,16 @@ def predecir_lote(df, interval_models, clasif_models, df_ic,
 
 
 # ============================================================
-# ESTILO: SEMAFORIZACIÓN EN TABLA
+# SEMÁFORO EN TABLA STREAMLIT
 # ============================================================
 
 def color_semaforo(val):
     if val == "DENTRO":
-        return "background-color: #d4edda;"  # verde suave
+        return "background-color: #d4edda;"
     if val == "FUERA":
-        return "background-color: #f8d7da;"  # rojo suave
+        return "background-color: #f8d7da;"
     if val == "CUMPLE":
-        return "background-color: #cce5ff;"  # azul claro
+        return "background-color: #cce5ff;"
     if val == "NO CUMPLE":
         return "background-color: #f8d7da;"
     if val == "BAJO":
@@ -269,155 +255,211 @@ def color_semaforo(val):
 
 
 # ============================================================
+# EXPORTACIÓN A GOOGLE SHEETS (CON SEMÁFORO)
+# ============================================================
+
+def exportar_google_sheets(df):
+    try:
+        creds_info = st.secrets["gcp_service_account"]
+        sheet_id = st.secrets["google_sheets"]["sheet_id"]
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        client = gspread.authorize(creds)
+
+        sheet = client.open_by_key(sheet_id)
+
+        fecha = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        nombre_hoja = f"Predicciones_{fecha}"
+
+        worksheet = sheet.add_worksheet(
+            title=nombre_hoja,
+            rows=str(len(df) + 10),
+            cols=str(len(df.columns) + 5)
+        )
+
+        data = [df.columns.tolist()] + df.astype(str).values.tolist()
+        worksheet.update(data)
+
+        # Columnas a colorear
+        col_pred = df.columns.get_loc("Pred_Conformidad") + 1
+        col_riesgo = df.columns.get_loc("Nivel_de_Riesgo") + 1
+        col_intervalo = df.columns.get_loc("Dictamen_por_intervalo") + 1
+
+        n_rows = len(df) + 1
+
+        # Colores
+        verde = CellFormat(backgroundColor=Color(0.80, 1.00, 0.80))
+        rojo = CellFormat(backgroundColor=Color(1.00, 0.80, 0.80))
+        amarillo = CellFormat(backgroundColor=Color(1.00, 1.00, 0.60))
+        gris = CellFormat(backgroundColor=Color(0.90, 0.90, 0.90))
+
+        # ===== FORMATO POR FILA =====
+        for i in range(2, n_rows + 1):
+            pred_v = df.iloc[i-2]["Pred_Conformidad"]
+            riesgo_v = df.iloc[i-2]["Nivel_de_Riesgo"]
+            dict_v = df.iloc[i-2]["Dictamen_por_intervalo"]
+
+            # Col Predict
+            fmt = verde if pred_v == "CUMPLE" else rojo
+            format_cell_range(worksheet, f"{chr(64+col_pred)}{i}", fmt)
+
+            # Col Riesgo
+            if riesgo_v == "BAJO":
+                fmt = verde
+            elif riesgo_v == "MEDIO":
+                fmt = amarillo
+            elif riesgo_v == "ALTO":
+                fmt = rojo
+            else:
+                fmt = gris
+            format_cell_range(worksheet, f"{chr(64+col_riesgo)}{i}", fmt)
+
+            # Col Dictamen
+            fmt = verde if dict_v == "DENTRO" else rojo
+            format_cell_range(worksheet, f"{chr(64+col_intervalo)}{i}", fmt)
+
+        return True, nombre_hoja
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ============================================================
 # INTERFAZ STREAMLIT
 # ============================================================
 
 def main():
-
     st.title("🔮 Sistema Predictivo de Medidores de Agua")
     st.markdown("---")
 
     opcion = st.sidebar.radio("Fuente de datos:", ["Google Sheets", "Subir archivo CSV"])
 
     interval_models, clasif_models = cargar_modelos()
-
     df_ic = pd.read_csv(DEGRADACIONES_FILE)
 
-    # ----------------- CARGA DE DATOS -----------------
+    # ===== CARGA DE DATOS =====
     if opcion == "Google Sheets":
         try:
             if SHEET_URL.endswith("output=xlsx"):
                 df_base = pd.read_excel(SHEET_URL)
             else:
                 df_base = pd.read_csv(SHEET_URL)
-
             st.success("Datos cargados desde Google Sheets.")
-
         except Exception as e:
             st.error(f"Error cargando Google Sheets: {e}")
             return
-
     else:
         file = st.file_uploader("Sube un archivo CSV", type=["csv"])
-
         if not file:
             st.info("Sube un archivo CSV para continuar.")
             return
-
         df_base = pd.read_csv(file)
         st.success("Archivo CSV cargado correctamente.")
 
     st.write("### 🔎 Vista previa")
     st.dataframe(df_base.head())
 
-    # ----------------- PREDICCIÓN -----------------
+    # ===== EJECUTAR PREDICCIÓN =====
     if st.button("🚀 Ejecutar Predicción"):
+
         df_pred = predecir_lote(df_base, interval_models, clasif_models, df_ic)
 
         if df_pred.empty:
-            st.error("No se pudieron generar las predicciones.")
+            st.error("No se pudieron generar predicciones.")
             return
 
         st.success("Predicción completada.")
 
-        # Pestañas: Resultados y Dashboard
         tab1, tab2 = st.tabs(["📄 Resultados", "📊 Dashboard"])
 
-        # ==================== TABLA + SEMÁFORO ====================
+        # ================= TABLA =================
         with tab1:
             st.write("### 📊 Resultados detallados")
 
-            # Tabla con estilos
             try:
                 styled = df_pred.style.applymap(
                     color_semaforo,
                     subset=["Pred_Conformidad", "Dictamen_por_intervalo", "Nivel_de_Riesgo"]
                 )
                 st.dataframe(styled, use_container_width=True)
-            except Exception:
-                # Si hay algún problema con Styler, mostramos la tabla normal
+            except:
                 st.dataframe(df_pred, use_container_width=True)
 
             st.download_button(
                 "📥 Descargar CSV",
                 df_pred.to_csv(index=False),
-                "predicciones_medidores.csv",
-                "text/csv"
+                "predicciones_medidores.csv"
             )
 
-        # ==================== DASHBOARD ====================
+            # ===== EXPORTAR GOOGLE SHEETS =====
+            st.markdown("### 📤 Exportar a Google Sheets")
+
+            if st.button("Enviar a Google Sheets"):
+                ok, msg = exportar_google_sheets(df_pred)
+                if ok:
+                    st.success(f"Predicción exportada correctamente en la hoja: {msg}")
+                else:
+                    st.error(f"Error: {msg}")
+
+        # ================= DASHBOARD =================
         with tab2:
             st.write("### 🧮 Indicadores globales")
 
             col1, col2, col3 = st.columns(3)
 
-            # Medidores dentro del EMP
-            dentro_emp = (df_pred["Dictamen_por_intervalo"] == "DENTRO").mean()
-            dentro_emp = dentro_emp * 100 if not np.isnan(dentro_emp) else 0
+            # EMP
+            dentro_emp = (df_pred["Dictamen_por_intervalo"] == "DENTRO").mean() * 100
 
-            # Medidores que cumplen
-            cumple = (df_pred["Pred_Conformidad"] == "CUMPLE").mean()
-            cumple = cumple * 100 if not np.isnan(cumple) else 0
+            # CUMPLE
+            cumple = (df_pred["Pred_Conformidad"] == "CUMPLE").mean() * 100
 
-            # Vida remanente promedio
+            # Vida útil
             vida_series = pd.to_numeric(df_pred["Vida_remanente"], errors="coerce")
-            vida_prom = vida_series.mean() if not vida_series.empty else np.nan
+            vida_prom = vida_series.mean()
 
-            with col1:
-                st.metric("Medidores dentro del EMP", f"{dentro_emp:.1f}%")
-            with col2:
-                st.metric("Medidores que CUMPLEN", f"{cumple:.1f}%")
-            with col3:
-                if np.isnan(vida_prom):
-                    st.metric("Vida remanente promedio", "N/D")
-                else:
-                    st.metric("Vida remanente promedio", f"{vida_prom:.1f} años")
+            col1.metric("Medidores dentro del EMP", f"{dentro_emp:.1f}%")
+            col2.metric("Medidores que CUMPLEN", f"{cumple:.1f}%")
+            col3.metric("Vida remanente promedio", f"{vida_prom:.1f} años")
 
             st.markdown("---")
+
+            # ===== Riesgo =====
             st.write("### Distribución de riesgo")
+            st.bar_chart(
+                df_pred["Nivel_de_Riesgo"].value_counts()
+                .reindex(["BAJO", "MEDIO", "ALTO", "SIN MODELO"])
+                .fillna(0)
+            )
 
-            if "Nivel_de_Riesgo" in df_pred.columns:
-                riesgo_counts = df_pred["Nivel_de_Riesgo"].value_counts().reindex(
-                    ["BAJO", "MEDIO", "ALTO", "SIN MODELO"]
-                ).fillna(0)
-                st.bar_chart(riesgo_counts)
-            else:
-                st.info("No se encontró la columna 'Nivel_de_Riesgo'.")
+            # ===== Conformidad =====
+            st.write("### Distribución CUMPLE / NO CUMPLE")
+            st.bar_chart(df_pred["Pred_Conformidad"].value_counts())
 
-            st.markdown("### Distribución CUMPLE / NO CUMPLE")
-            if "Pred_Conformidad" in df_pred.columns:
-                cumple_counts = df_pred["Pred_Conformidad"].value_counts()
-                st.bar_chart(cumple_counts)
-            else:
-                st.info("No se encontró la columna 'Pred_Conformidad'.")
+            # ===== Vida por modelo =====
+            st.write("### Vida remanente promedio por modelo")
+            vida_mod = (
+                df_pred.assign(Vida=pd.to_numeric(df_pred["Vida_remanente"], errors="coerce"))
+                .groupby("Modelo_corto")["Vida"].mean().sort_values()
+            )
+            st.bar_chart(vida_mod)
 
-            st.markdown("### Vida remanente promedio por modelo")
-            if "Modelo_corto" in df_pred.columns and "Vida_remanente" in df_pred.columns:
-                df_vida_modelo = (
-                    df_pred
-                    .assign(Vida_remanente_num=pd.to_numeric(df_pred["Vida_remanente"], errors="coerce"))
-                    .groupby("Modelo_corto")["Vida_remanente_num"]
-                    .mean()
-                    .sort_values()
-                )
-                st.bar_chart(df_vida_modelo)
+            # ===== EQ3 mid =====
+            st.write("### Histograma de EQ3_mid (%)")
+            eq = pd.to_numeric(df_pred["EQ3_mid (%)"], errors="coerce").dropna()
+            if not eq.empty:
+                hist = np.histogram(eq, bins=20)
+                hist_df = pd.DataFrame({"bin": hist[1][:-1].astype(str), "freq": hist[0]})
+                st.bar_chart(hist_df.set_index("bin"))
             else:
-                st.info("No se puede calcular la vida remanente por modelo.")
-
-            st.markdown("### Histograma de EQ3_mid (%)")
-            if "EQ3_mid (%)" in df_pred.columns:
-                eq = pd.to_numeric(df_pred["EQ3_mid (%)"], errors="coerce").dropna()
-                if not eq.empty:
-                    # Usamos value_counts por bins para evitar importar matplotlib
-                    hist = np.histogram(eq, bins=20)
-                    hist_df = pd.DataFrame({"bin": hist[1][:-1].astype(str), "freq": hist[0]})
-                    st.bar_chart(hist_df.set_index("bin"))
-                else:
-                    st.info("No hay datos válidos de EQ3_mid (%).")
-            else:
-                st.info("No se encontró la columna 'EQ3_mid (%)'.")
+                st.info("No hay datos válidos para EQ3_mid (%)")
 
 
 if __name__ == "__main__":
     main()
+
 
